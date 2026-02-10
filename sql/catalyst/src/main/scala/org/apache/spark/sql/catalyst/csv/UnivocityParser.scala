@@ -316,7 +316,8 @@ class UnivocityParser(
 
   private def parseLine(line: String): Array[String] = {
     try {
-      tokenizer.parseLine(line)
+      val lineWithNewline = if (line.endsWith("\n") || line.endsWith("\r")) line else line + "\n"
+      tokenizer.parseLine(lineWithNewline)
     }
     catch {
       case e: TextParsingException if e.getCause.isInstanceOf[ArrayIndexOutOfBoundsException] =>
