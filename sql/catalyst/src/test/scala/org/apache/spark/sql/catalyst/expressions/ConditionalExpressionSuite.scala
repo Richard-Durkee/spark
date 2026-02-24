@@ -71,6 +71,34 @@ class ConditionalExpressionSuite extends SparkFunSuite with ExpressionEvalHelper
     }
   }
 
+  test("if - two argument form") {
+    // Test two-argument if(condition, trueValue) which returns null when condition is false
+    checkEvaluation(
+      new If(TrueLiteral, Literal(1)),
+      1)
+
+    checkEvaluation(
+      new If(FalseLiteral, Literal(1)),
+      null)
+
+    checkEvaluation(
+      new If(Literal.create(null, BooleanType), Literal(1)),
+      null)
+
+    checkEvaluation(
+      new If(TrueLiteral, Literal("a")),
+      "a")
+
+    checkEvaluation(
+      new If(FalseLiteral, Literal("a")),
+      null)
+
+    // Verify nullable is true for two-argument form, even when trueValue is non-nullable
+    val nonNullableLiteral = Literal(1)
+    assert(!nonNullableLiteral.nullable)
+    assert(new If(TrueLiteral, nonNullableLiteral).nullable)
+  }
+
   test("case when") {
     val row = create_row(null, false, true, "a", "b", "c")
     val c1 = $"a".boolean.at(0)
