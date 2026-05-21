@@ -701,6 +701,182 @@ object InlineOuterGeneratorBuilder extends InlineGeneratorBuilderBase {
   override def isOuter: Boolean = true
 }
 
+/**
+ * Given one or more arrays or maps, produces rows by iterating through them in parallel
+ * (zip-aligned). Shorter collections are padded with NULL. This implements SQL standard
+ * UNNEST semantics (SQL:2003 §7.6).
+ *
+ * For a single array argument, this is equivalent to [[Explode]].
+ * For multiple array arguments, elements at the same position are combined into one row.
+ *
+ * {{{
+ *   SELECT * FROM zip_explode(array(1, 2, 3), array('a', 'b')) AS t(x, y)
+ *   -- produces:
+ *   -- 1, 'a'
+ *   -- 2, 'b'
+ *   -- 3, NULL
+ * }}}
+ */
+case class ZipExplode(children: Seq[Expression]) extends Generator with CodegenFallback {
+
+  override def checkInputDataTypes(): TypeCheckResult = {
+    if (children.isEmpty) {
+      throw QueryCompilationErrors.wrongNumArgsError(
+        toSQLId(prettyName), Seq(">= 1"), children.length
+      )
+    }
+    val nonCollection = children.zipWithIndex.filter {
+      case (e, _) => !e.dataType.isInstanceOf[ArrayType] && !e.dataType.isInstanceOf[MapType]
+    }
+    if (nonCollection.nonEmpty) {
+      DataTypeMismatch(
+        errorSubClass = "UNEXPECTED_INPUT_TYPE",
+        messageParameters = Map(
+          "paramIndex" -> ordinalNumber(nonCollection.head._2),
+          "requiredType" -> toSQLType(TypeCollection(ArrayType, MapType)),
+          "inputSql" -> toSQLExpr(nonCollection.head._1),
+          "inputType" -> toSQLType(nonCollection.head._1.dataType)))
+    } else {
+      TypeCheckResult.TypeCheckSuccess
+    }
+  }
+
+  override def elementSchema: StructType = {
+    val fields = children.zipWithIndex.flatMap { case (child, i) =>
+      child.dataType match {
+        case ArrayType(et, _) =>
+          Seq(StructField(s"col$i", et, nullable = true))
+        case MapType(kt, vt, _) =>
+          Seq(StructField(s"key$i", kt, nullable = false),
+              StructField(s"value$i", vt, nullable = true))
+        case _ => Seq.empty
+      }
+    }
+    new StructType(fields.toArray)
+  }
+
+  override def eval(input: InternalRow): IterableOnce[InternalRow] = {
+    val expanded: Seq[Seq[Seq[Any]]] = children.map { child =>
+      val value = child.eval(input)
+      if (value == null) {
+        Seq.empty
+      } else {
+        child.dataType match {
+          case ArrayType(et, _) =>
+            val arr = value.asInstanceOf[ArrayData]
+            (0 until arr.numElements()).map(i => Seq(arr.get(i, et)))
+          case MapType(kt, vt, _) =>
+            val map = value.asInstanceOf[MapData]
+            val keys = map.keyArray()
+            val values = map.valueArray()
+            (0 until map.numElements()).map(i => Seq(keys.get(i, kt), values.get(i, vt)))
+          case _ => Seq.empty
+        }
+      }
+    }
+
+    val maxLen = if (expanded.isEmpty) 0 else expanded.map(_.size).max
+    if (maxLen == 0) return Nil
+
+    val numCols = elementSchema.length
+    (0 until maxLen).map { pos =>
+      val fields = new Array[Any](numCols)
+      var fieldIdx = 0
+      expanded.foreach { rows =>
+        val colsPerChild = if (rows.nonEmpty) rows.head.size else {
+          // Determine from schema
+          children(expanded.indexOf(rows)).dataType match {
+            case _: ArrayType => 1
+            case _: MapType => 2
+            case _ => 1
+          }
+        }
+        if (pos < rows.size) {
+          rows(pos).foreach { v => fields(fieldIdx) = v; fieldIdx += 1 }
+        } else {
+          (0 until colsPerChild).foreach { _ => fields(fieldIdx) = null; fieldIdx += 1 }
+        }
+      }
+      InternalRow(fields.toIndexedSeq: _*)
+    }
+  }
+
+  override def prettyName: String = "zip_explode"
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[Expression]): ZipExplode = copy(children = newChildren)
+}
+
+trait ZipExplodeGeneratorBuilderBase extends GeneratorBuilder {
+  override def functionSignature: Option[FunctionSignature] = None
+  override def buildGenerator(funcName: String, expressions: Seq[Expression]): Generator = {
+    ZipExplode(expressions)
+  }
+}
+
+// scalastyle:off line.size.limit line.contains.tab
+@ExpressionDescription(
+  usage = "_FUNC_(expr1, ...) - Separates the elements of one or more arrays into rows (zip-aligned). For maps, produces key and value columns. Shorter arrays are padded with NULL.",
+  examples = """
+    Examples:
+      > SELECT _FUNC_(array(10, 20));
+       10
+       20
+      > SELECT _FUNC_(array(1, 2, 3), array('a', 'b'));
+       1	a
+       2	b
+       3	NULL
+  """,
+  since = "5.0.0",
+  group = "generator_funcs")
+// scalastyle:on line.size.limit line.contains.tab
+object ZipExplodeExpressionBuilder extends ExpressionBuilder {
+  override def functionSignature: Option[FunctionSignature] = None
+
+  override def build(funcName: String, expressions: Seq[Expression]): Expression =
+    ZipExplode(expressions)
+}
+
+// scalastyle:off line.size.limit line.contains.tab
+@ExpressionDescription(
+  usage = "_FUNC_(expr1, ...) - Separates the elements of one or more arrays into rows (zip-aligned). For maps, produces key and value columns. Shorter arrays are padded with NULL.",
+  examples = """
+    Examples:
+      > SELECT * FROM _FUNC_(array(10, 20));
+       10
+       20
+      > SELECT * FROM _FUNC_(array(1, 2, 3), array('a', 'b'));
+       1	a
+       2	b
+       3	NULL
+  """,
+  since = "5.0.0",
+  group = "generator_funcs")
+// scalastyle:on line.size.limit line.contains.tab
+object ZipExplodeGeneratorBuilder extends ZipExplodeGeneratorBuilderBase {
+  override def isOuter: Boolean = false
+}
+
+// scalastyle:off line.size.limit line.contains.tab
+@ExpressionDescription(
+  usage = "_FUNC_(expr1, ...) - Separates the elements of one or more arrays into rows (zip-aligned). For maps, produces key and value columns. Shorter arrays are padded with NULL. Returns at least one row even if all inputs are empty or null.",
+  examples = """
+    Examples:
+      > SELECT * FROM _FUNC_(array(10, 20));
+       10
+       20
+      > SELECT * FROM _FUNC_(array(1, 2, 3), array('a', 'b'));
+       1	a
+       2	b
+       3	NULL
+  """,
+  since = "5.0.0",
+  group = "generator_funcs")
+// scalastyle:on line.size.limit line.contains.tab
+object ZipExplodeOuterGeneratorBuilder extends ZipExplodeGeneratorBuilderBase {
+  override def isOuter: Boolean = true
+}
+
 @ExpressionDescription(
   usage = """_FUNC_() - Get Spark SQL keywords""",
   examples = """
