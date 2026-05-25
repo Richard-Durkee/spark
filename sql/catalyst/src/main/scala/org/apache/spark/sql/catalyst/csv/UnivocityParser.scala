@@ -322,7 +322,7 @@ class UnivocityParser(
       case e: TextParsingException if e.getCause.isInstanceOf[ArrayIndexOutOfBoundsException] =>
         throw new SparkRuntimeException(
           errorClass = "MALFORMED_CSV_RECORD",
-          messageParameters = Map("badRecord" -> line),
+          messageParameters = Map("badRecord" -> line.stripLineEnd),
           cause = e
         )
     }
@@ -662,8 +662,9 @@ private[sql] object UnivocityParser {
 
     val filteredLines: Iterator[String] = CSVExprUtils.filterCommentAndEmpty(lines, options)
 
+    val appendNewline = options.lineSeparator.isEmpty
     val safeParser = new FailureSafeParser[String](
-      input => parser.parse(input),
+      input => parser.parse(if (appendNewline) input + "\n" else input),
       parser.options.parseMode,
       schema,
       parser.options.columnNameOfCorruptRecord)
